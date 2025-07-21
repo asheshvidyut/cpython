@@ -2,34 +2,26 @@
 #  error "this header file must not be included directly"
 #endif
 
-typedef struct _dictkeysobject PyDictKeysObject;
-typedef struct _dictvalues PyDictValues;
+// Add new Swiss Table dict entry struct
 
-/* The ma_values pointer is NULL for a combined table
- * or points to an array of PyObject* for a split table
- */
+typedef struct _dictentry {
+    PyObject *key;
+    PyObject *value;
+    struct _dictentry *prev, *next; // For insertion order
+    uint8_t control; // 8 bits: 1 for state, 7 for hash
+} DictEntry;
+
+// Redefine PyDictObject for Swiss Table
+
 typedef struct {
     PyObject_HEAD
-
-    /* Number of items in the dictionary */
-    Py_ssize_t ma_used;
-
-    /* This is a private field for CPython's internal use.
-     * Bits 0-7 are for dict watchers.
-     * Bits 8-11 are for the watched mutation counter (used by tier2 optimization)
-     * Bits 12-31 are currently unused
-     * Bits 32-63 are a unique id in the free threading build (used for per-thread refcounting)
-     */
-    uint64_t _ma_watcher_tag;
-
-    PyDictKeysObject *ma_keys;
-
-    /* If ma_values is NULL, the table is "combined": keys and values
-       are stored in ma_keys.
-
-       If ma_values is not NULL, the table is split:
-       keys are stored in ma_keys and values are stored in ma_values */
-    PyDictValues *ma_values;
+    DictEntry *entries;      // Array of entries
+    uint8_t *control_bytes;  // Array of control bytes
+    Py_ssize_t capacity;     // Number of slots
+    Py_ssize_t used;         // Number of used slots
+    Py_ssize_t deleted;      // Number of deleted slots
+    DictEntry *ma_head;      // First in insertion order
+    DictEntry *ma_tail;      // Last in insertion order
 } PyDictObject;
 
 PyAPI_FUNC(PyObject *) _PyDict_GetItem_KnownHash(PyObject *mp, PyObject *key,
@@ -55,9 +47,9 @@ static inline Py_ssize_t PyDict_GET_SIZE(PyObject *op) {
     assert(PyDict_Check(op));
     mp = _Py_CAST(PyDictObject*, op);
 #ifdef Py_GIL_DISABLED
-    return _Py_atomic_load_ssize_relaxed(&mp->ma_used);
+    return _Py_atomic_load_ssize_relaxed(&mp->used);
 #else
-    return mp->ma_used;
+    return mp->used;
 #endif
 }
 #define PyDict_GET_SIZE(op) PyDict_GET_SIZE(_PyObject_CAST(op))
