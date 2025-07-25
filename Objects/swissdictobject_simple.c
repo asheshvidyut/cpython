@@ -150,31 +150,19 @@ swissdict_ass_sub(SwissDictObject *self, PyObject *key, PyObject *value) {
 
 static SwissDictEntry*
 find_entry(SwissDictObject *self, PyObject *key, Py_hash_t hash) {
-    size_t h1 = hash % self->num_groups;
+    Py_ssize_t h1 = hash % self->num_groups;
     uint8_t h2 = (hash >> 8) & SWISS_H2_MASK;
     
-    for (size_t i = 0; i < self->num_groups; ++i) {
-        size_t group_idx = (h1 + i) % self->num_groups;
+    for (Py_ssize_t i = 0; i < self->num_groups; ++i) {
+        Py_ssize_t group_idx = (h1 + i) % self->num_groups;
         uint64_t control_low = self->control_words[group_idx * 2];
         uint64_t control_high = self->control_words[group_idx * 2 + 1];
         
-        // SIMD-optimized: Use bit operations to find matches efficiently
-        // Create a mask where each byte is h2
-        uint64_t h2_mask = 0x0101010101010101ULL * h2;
-        
-        // Find matches using XOR - if result is 0, we have a match
-        uint64_t match_low = (control_low ^ h2_mask) & 0x7F7F7F7F7F7F7F7FULL;
-        uint64_t match_high = (control_high ^ h2_mask) & 0x7F7F7F7F7F7F7F7FULL;
-        
-        // Check for empty slots for early exit
-        uint64_t empty_low = control_low & 0x8080808080808080ULL;
-        uint64_t empty_high = control_high & 0x8080808080808080ULL;
-        
-        // Process matches in low control word (first 8 slots)
+        // Check each byte in the control word (16 bytes total)
         for (int j = 0; j < 8; ++j) {
             uint8_t ctrl_byte = (control_low >> (j * 8)) & 0xFF;
             if (ctrl_byte == h2) {
-                size_t slot = group_idx * SWISS_GROUP_SIZE + j;
+                Py_ssize_t slot = group_idx * SWISS_GROUP_SIZE + j;
                 if (slot < self->capacity) {
                     SwissDictEntry *entry = &self->entries[slot];
                     if (entry->key != NULL && entry->hash == hash && 
@@ -192,7 +180,7 @@ find_entry(SwissDictObject *self, PyObject *key, Py_hash_t hash) {
         for (int j = 0; j < 8; ++j) {
             uint8_t ctrl_byte = (control_high >> (j * 8)) & 0xFF;
             if (ctrl_byte == h2) {
-                size_t slot = group_idx * SWISS_GROUP_SIZE + j + 8;
+                Py_ssize_t slot = group_idx * SWISS_GROUP_SIZE + j + 8;
                 if (slot < self->capacity) {
                     SwissDictEntry *entry = &self->entries[slot];
                     if (entry->key != NULL && entry->hash == hash && 

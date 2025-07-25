@@ -43,7 +43,7 @@
 
 // Include our new object's implementation. This is a simple way
 // to link it into the module for testing purposes.
-#include "../Objects/swissdictobject.c"
+#include "../Objects/swissdictobject_simple.c"
 
 
 #define MODULE_NAME "_testinternalcapi"
