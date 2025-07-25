@@ -1,5 +1,5 @@
 #include "Python.h"
-#include "../Objects/swissdictobject.c"
+#include "../Objects/swissdictobject_simple.c"
 
 static struct PyModuleDef swissmodule = {
     PyModuleDef_HEAD_INIT,
