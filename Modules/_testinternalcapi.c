@@ -41,6 +41,10 @@
 // Include test definitions from _testinternalcapi/
 #include "_testinternalcapi/parts.h"
 
+// Include our new object's implementation. This is a simple way
+// to link it into the module for testing purposes.
+#include "../Objects/swissdictobject.c"
+
 
 #define MODULE_NAME "_testinternalcapi"
 
@@ -2549,6 +2553,16 @@ module_exec(PyObject *module)
     if (PyModule_Add(module, "SHARED_KEYS_MAX_SIZE",
                         PyLong_FromLong(SHARED_KEYS_MAX_SIZE)) < 0) {
         return 1;
+    }
+
+    // Make the SwissDict type ready and add it to the module.
+    if (PyType_Ready(&SwissDict_Type) < 0) {
+        return -1;
+    }
+    Py_INCREF(&SwissDict_Type);
+    if (PyModule_AddObject(module, "SwissDict", (PyObject *)&SwissDict_Type) < 0) {
+        Py_DECREF(&SwissDict_Type);
+        return -1;
     }
 
     return 0;

@@ -786,8 +786,8 @@ new_keys_object(uint8_t log2_size, bool unicode)
                           + entry_size * usable);
         if (dk == NULL) {
             PyErr_NoMemory();
-            return NULL;
-        }
+        return NULL;
+    }
     }
 #ifdef Py_REF_DEBUG
     _Py_IncRefTotal(_PyThreadState_GET());
@@ -1723,8 +1723,8 @@ insert_combined_dict(PyInterpreterState *interp, PyDictObject *mp,
     if (mp->ma_keys->dk_usable <= 0) {
         /* Need to resize. */
         if (insertion_resize(mp, 1) < 0) {
-            return -1;
-        }
+        return -1;
+    }
     }
 
     _PyDict_NotifyEvent(interp, PyDict_EVENT_ADDED, mp, key, value);
@@ -1831,8 +1831,8 @@ insertdict(PyInterpreterState *interp, PyDictObject *mp,
             insert_split_value(interp, mp, key, value, ix);
             Py_DECREF(key);
             Py_DECREF(value);
-            return 0;
-        }
+    return 0;
+}
 
         /* No space in shared keys. Resize and continue below. */
         if (insertion_resize(mp, 1) < 0) {
@@ -3750,7 +3750,7 @@ merge_from_seq2_lock_held(PyObject *d, PyObject *seq2, int override)
         /* Update/merge with this (key, value) pair. */
         key = PySequence_Fast_GET_ITEM(fast, 0);
         value = PySequence_Fast_GET_ITEM(fast, 1);
-        Py_INCREF(key);
+    Py_INCREF(key);
         Py_INCREF(value);
         if (override) {
             if (setitem_lock_held((PyDictObject *)d, key, value) < 0) {
