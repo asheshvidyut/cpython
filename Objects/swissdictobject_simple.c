@@ -36,7 +36,6 @@ typedef struct {
 
 /* --- Forward Declarations --- */
 static int swissdict_resize(SwissDictObject *self, Py_ssize_t min_size);
-static SwissDictEntry* find_entry(SwissDictObject *self, PyObject *key, Py_hash_t hash);
 static int insert_into_table(SwissDictObject *self, PyObject *key, PyObject *value, Py_hash_t hash);
 
 /* --- SIMD-optimized Group Operations (Abseil-inspired) --- */
@@ -138,9 +137,9 @@ swissdict_subscript(SwissDictObject *self, PyObject *key) {
     if (hash == -1) return NULL;
     
     // Find the entry
+    Py_ssize_t h1 = hash % self->num_groups;
     for (Py_ssize_t g = 0; g < self->num_groups; g++) {
-        SwissGroup *group = &self->groups[g];
-        Py_ssize_t h1 = hash % self->num_groups;
+        SwissGroup *group = &self->groups[(h1 + g) % self->num_groups];
         uint8_t h2 = (hash >> 8) & SWISS_H2_MASK;
         
         // Load control word using SIMD
@@ -193,9 +192,9 @@ swissdict_ass_sub(SwissDictObject *self, PyObject *key, PyObject *value) {
     if (hash == -1) return -1;
     
     // Check if key already exists
+    Py_ssize_t h1 = hash % self->num_groups;
     for (Py_ssize_t g = 0; g < self->num_groups; g++) {
-        SwissGroup *group = &self->groups[g];
-        Py_ssize_t h1 = hash % self->num_groups;
+        SwissGroup *group = &self->groups[(h1 + g) % self->num_groups];
         uint8_t h2 = (hash >> 8) & SWISS_H2_MASK;
         
         __m128i control = load_group_control(group);
@@ -245,7 +244,7 @@ insert_into_table(SwissDictObject *self, PyObject *key, PyObject *value, Py_hash
     uint8_t h2 = (hash >> 8) & SWISS_H2_MASK;
     
     for (Py_ssize_t g = 0; g < self->num_groups; g++) {
-        SwissGroup *group = &self->groups[g];
+        SwissGroup *group = &self->groups[(h1 + g) % self->num_groups];
         
         // Load control word using SIMD
         __m128i control = load_group_control(group);
