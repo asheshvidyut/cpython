@@ -1,16 +1,15 @@
 /*
- * CPython SwissDict Implementation - Simple Optimized Version
+ * CPython SwissDict Implementation - Abseil-inspired Optimized Version
  *
- * This implementation removes the linked list overhead and uses
- * better hash utilization for improved performance.
- * Key optimizations:
- * - No linked list overhead
- * - Better hash function utilization
- * - Compact memory layout
- * - Pure Swiss Table design
+ * This implementation is inspired by Abseil's flat_hash_map with:
+ * - SIMD-optimized group operations (16-byte groups)
+ * - Better memory layout for cache locality
+ * - Efficient hash fingerprinting
+ * - Optimized probing strategy
  */
 
 #include "Python.h"
+#include <immintrin.h>  // For SIMD instructions
 
 /* --- Data Structures --- */
 #define SWISS_GROUP_SIZE 16
@@ -18,27 +17,68 @@
 #define SWISS_DELETED 0xFE
 #define SWISS_H2_MASK 0x7F
 
-// Compact entry structure - no linked list overhead
+// Group structure for better cache locality (inspired by Abseil)
 typedef struct {
-    PyObject *key;
-    PyObject *value;
-    Py_hash_t hash;
-} SwissDictEntry;
+    uint8_t control[SWISS_GROUP_SIZE];  // Control bytes
+    PyObject *keys[SWISS_GROUP_SIZE];   // Keys
+    PyObject *values[SWISS_GROUP_SIZE]; // Values
+    Py_hash_t hashes[SWISS_GROUP_SIZE]; // Hashes
+} SwissGroup;
 
 typedef struct {
     PyObject_HEAD
     Py_ssize_t used;
     Py_ssize_t capacity;
     uint32_t version;
-    SwissDictEntry *entries;  // Compact array of entries
     Py_ssize_t num_groups;
-    uint64_t *control_words;
+    SwissGroup *groups;  // Array of groups for better cache locality
 } SwissDictObject;
 
 /* --- Forward Declarations --- */
 static int swissdict_resize(SwissDictObject *self, Py_ssize_t min_size);
 static SwissDictEntry* find_entry(SwissDictObject *self, PyObject *key, Py_hash_t hash);
 static int insert_into_table(SwissDictObject *self, PyObject *key, PyObject *value, Py_hash_t hash);
+
+/* --- SIMD-optimized Group Operations (Abseil-inspired) --- */
+
+static inline __m128i load_group_control(const SwissGroup *group) {
+    return _mm_loadu_si128((const __m128i*)group->control);
+}
+
+static inline int find_match_in_group_simd(__m128i control, uint8_t h2) {
+    // Create a vector with h2 repeated 16 times
+    __m128i h2_vec = _mm_set1_epi8(h2);
+    
+    // Compare control word with h2
+    __m128i match = _mm_cmpeq_epi8(control, h2_vec);
+    
+    // Get the mask of matching bytes
+    return _mm_movemask_epi8(match);
+}
+
+static inline int find_empty_in_group_simd(__m128i control) {
+    // Create a vector with SWISS_EMPTY repeated 16 times
+    __m128i empty_vec = _mm_set1_epi8(SWISS_EMPTY);
+    
+    // Compare control word with empty marker
+    __m128i match = _mm_cmpeq_epi8(control, empty_vec);
+    
+    // Get the mask of empty bytes
+    return _mm_movemask_epi8(match);
+}
+
+static inline int find_available_in_group_simd(__m128i control) {
+    // Create vectors for empty and deleted markers
+    __m128i empty_vec = _mm_set1_epi8(SWISS_EMPTY);
+    __m128i deleted_vec = _mm_set1_epi8(SWISS_DELETED);
+    
+    // Find empty or deleted slots
+    __m128i empty_match = _mm_cmpeq_epi8(control, empty_vec);
+    __m128i deleted_match = _mm_cmpeq_epi8(control, deleted_vec);
+    __m128i available = _mm_or_si128(empty_match, deleted_match);
+    
+    return _mm_movemask_epi8(available);
+}
 
 /* --- Core Methods --- */
 
@@ -50,43 +90,40 @@ swissdict_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
     self->used = 0;
     self->capacity = SWISS_GROUP_SIZE;
     self->version = 0;
-    
-    // Allocate entries array
-    self->entries = PyMem_Calloc(self->capacity, sizeof(SwissDictEntry));
-    if (!self->entries) {
-        Py_DECREF(self);
-        return PyErr_NoMemory();
-    }
-    
-    // Allocate control words (16 bytes per group = 2 uint64_t words per group)
     self->num_groups = 1;
-    self->control_words = PyMem_Calloc(self->num_groups * 2, sizeof(uint64_t));
-    if (!self->control_words) {
-        PyMem_Free(self->entries);
+    
+    // Allocate groups array
+    self->groups = PyMem_Calloc(self->num_groups, sizeof(SwissGroup));
+    if (!self->groups) {
         Py_DECREF(self);
         return PyErr_NoMemory();
     }
     
-    // Initialize control words with empty markers (16 bytes = 0x80 repeated 16 times)
-    self->control_words[0] = 0x8080808080808080ULL;
-    self->control_words[1] = 0x8080808080808080ULL;
+    // Initialize first group with empty markers
+    for (int i = 0; i < SWISS_GROUP_SIZE; i++) {
+        self->groups[0].control[i] = SWISS_EMPTY;
+        self->groups[0].keys[i] = NULL;
+        self->groups[0].values[i] = NULL;
+        self->groups[0].hashes[i] = 0;
+    }
     
     return (PyObject *)self;
 }
 
 static void
 swissdict_dealloc(SwissDictObject *self) {
-    // Clean up all entries
-    for (Py_ssize_t i = 0; i < self->capacity; i++) {
-        SwissDictEntry *entry = &self->entries[i];
-        if (entry->key != NULL) {
-            Py_DECREF(entry->key);
-            Py_DECREF(entry->value);
+    // Clean up all groups
+    for (Py_ssize_t g = 0; g < self->num_groups; g++) {
+        SwissGroup *group = &self->groups[g];
+        for (int i = 0; i < SWISS_GROUP_SIZE; i++) {
+            if (group->keys[i] != NULL) {
+                Py_DECREF(group->keys[i]);
+                Py_DECREF(group->values[i]);
+            }
         }
     }
     
-    PyMem_Free(self->entries);
-    PyMem_Free(self->control_words);
+    PyMem_Free(self->groups);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
@@ -100,14 +137,49 @@ swissdict_subscript(SwissDictObject *self, PyObject *key) {
     Py_hash_t hash = PyObject_Hash(key);
     if (hash == -1) return NULL;
     
-    SwissDictEntry *entry = find_entry(self, key, hash);
-    if (entry == NULL) {
-        PyErr_SetObject(PyExc_KeyError, key);
-        return NULL;
+    // Find the entry
+    for (Py_ssize_t g = 0; g < self->num_groups; g++) {
+        SwissGroup *group = &self->groups[g];
+        Py_ssize_t h1 = hash % self->num_groups;
+        uint8_t h2 = (hash >> 8) & SWISS_H2_MASK;
+        
+        // Load control word using SIMD
+        __m128i control = load_group_control(group);
+        
+        // Find matches using SIMD
+        int match_mask = find_match_in_group_simd(control, h2);
+        
+        // Process matches
+        while (match_mask != 0) {
+            int match_pos = __builtin_ctz(match_mask);
+            
+            // Fast path: pointer equality
+            if (group->keys[match_pos] == key) {
+                Py_INCREF(group->values[match_pos]);
+                return group->values[match_pos];
+            }
+            
+            // Slow path: hash and object comparison
+            if (group->keys[match_pos] != NULL && 
+                group->hashes[match_pos] == hash && 
+                PyObject_RichCompareBool(group->keys[match_pos], key, Py_EQ) == 1) {
+                Py_INCREF(group->values[match_pos]);
+                return group->values[match_pos];
+            }
+            
+            // Clear the lowest set bit
+            match_mask &= match_mask - 1;
+        }
+        
+        // Check for early exit (all empty)
+        int empty_mask = find_empty_in_group_simd(control);
+        if (empty_mask == 0xFFFF) {
+            break; // Group is completely empty
+        }
     }
     
-    Py_INCREF(entry->value);
-    return entry->value;
+    PyErr_SetObject(PyExc_KeyError, key);
+    return NULL;
 }
 
 static int
@@ -121,14 +193,33 @@ swissdict_ass_sub(SwissDictObject *self, PyObject *key, PyObject *value) {
     if (hash == -1) return -1;
     
     // Check if key already exists
-    SwissDictEntry *existing = find_entry(self, key, hash);
-    if (existing) {
-        PyObject *old_value = existing->value;
-        Py_INCREF(value);
-        existing->value = value;
-        Py_DECREF(old_value);
-        self->version++;
-        return 0;
+    for (Py_ssize_t g = 0; g < self->num_groups; g++) {
+        SwissGroup *group = &self->groups[g];
+        Py_ssize_t h1 = hash % self->num_groups;
+        uint8_t h2 = (hash >> 8) & SWISS_H2_MASK;
+        
+        __m128i control = load_group_control(group);
+        int match_mask = find_match_in_group_simd(control, h2);
+        
+        while (match_mask != 0) {
+            int match_pos = __builtin_ctz(match_mask);
+            
+            if (group->keys[match_pos] == key || 
+                (group->keys[match_pos] != NULL && 
+                 group->hashes[match_pos] == hash && 
+                 PyObject_RichCompareBool(group->keys[match_pos], key, Py_EQ) == 1)) {
+                
+                // Update existing entry
+                PyObject *old_value = group->values[match_pos];
+                Py_INCREF(value);
+                group->values[match_pos] = value;
+                Py_DECREF(old_value);
+                self->version++;
+                return 0;
+            }
+            
+            match_mask &= match_mask - 1;
+        }
     }
     
     // Resize if needed (load factor > 0.875)
@@ -148,164 +239,88 @@ swissdict_ass_sub(SwissDictObject *self, PyObject *key, PyObject *value) {
 
 /* --- Optimized Swiss Table Logic --- */
 
-static SwissDictEntry*
-find_entry(SwissDictObject *self, PyObject *key, Py_hash_t hash) {
+static int
+insert_into_table(SwissDictObject *self, PyObject *key, PyObject *value, Py_hash_t hash) {
     Py_ssize_t h1 = hash % self->num_groups;
     uint8_t h2 = (hash >> 8) & SWISS_H2_MASK;
     
-    for (Py_ssize_t i = 0; i < self->num_groups; ++i) {
-        Py_ssize_t group_idx = (h1 + i) % self->num_groups;
-        uint64_t control_low = self->control_words[group_idx * 2];
-        uint64_t control_high = self->control_words[group_idx * 2 + 1];
+    for (Py_ssize_t g = 0; g < self->num_groups; g++) {
+        SwissGroup *group = &self->groups[g];
         
-        // Check each byte in the control word (16 bytes total)
-        for (int j = 0; j < 8; ++j) {
-            uint8_t ctrl_byte = (control_low >> (j * 8)) & 0xFF;
-            if (ctrl_byte == h2) {
-                Py_ssize_t slot = group_idx * SWISS_GROUP_SIZE + j;
-                if (slot < self->capacity) {
-                    SwissDictEntry *entry = &self->entries[slot];
-                    if (entry->key != NULL && entry->hash == hash && 
-                        PyObject_RichCompareBool(entry->key, key, Py_EQ) == 1) {
-                        return entry;
-                    }
-                }
-            }
-            if (ctrl_byte == SWISS_EMPTY) {
-                return NULL; // Early exit - key not found
-            }
-        }
+        // Load control word using SIMD
+        __m128i control = load_group_control(group);
         
-        // Process matches in high control word (last 8 slots)
-        for (int j = 0; j < 8; ++j) {
-            uint8_t ctrl_byte = (control_high >> (j * 8)) & 0xFF;
-            if (ctrl_byte == h2) {
-                Py_ssize_t slot = group_idx * SWISS_GROUP_SIZE + j + 8;
-                if (slot < self->capacity) {
-                    SwissDictEntry *entry = &self->entries[slot];
-                    if (entry->key != NULL && entry->hash == hash && 
-                        PyObject_RichCompareBool(entry->key, key, Py_EQ) == 1) {
-                        return entry;
-                    }
-                }
-            }
-            if (ctrl_byte == SWISS_EMPTY) {
-                return NULL; // Early exit - key not found
-            }
+        // Find available slots using SIMD
+        int available_mask = find_available_in_group_simd(control);
+        
+        if (available_mask != 0) {
+            int pos = __builtin_ctz(available_mask);
+            
+            // Set the entry
+            Py_INCREF(key);
+            Py_INCREF(value);
+            group->keys[pos] = key;
+            group->values[pos] = value;
+            group->hashes[pos] = hash;
+            group->control[pos] = h2;
+            
+            return 0;
         }
     }
     
-    return NULL;
-}
-
-static int
-insert_into_table(SwissDictObject *self, PyObject *key, PyObject *value, Py_hash_t hash) {
-    size_t h1 = hash % self->num_groups;
-    uint8_t h2 = (hash >> 8) & SWISS_H2_MASK;
-    
-    for (size_t i = 0; i < self->num_groups; ++i) {
-        size_t group_idx = (h1 + i) % self->num_groups;
-        uint64_t control_low = self->control_words[group_idx * 2];
-        uint64_t control_high = self->control_words[group_idx * 2 + 1];
-        
-        // Find empty or deleted slots efficiently
-        for (int j = 0; j < 8; ++j) {
-            uint8_t ctrl_byte = (control_low >> (j * 8)) & 0xFF;
-            if (ctrl_byte == SWISS_EMPTY || ctrl_byte == SWISS_DELETED) {
-                size_t slot = group_idx * SWISS_GROUP_SIZE + j;
-                if (slot < self->capacity) {
-                    SwissDictEntry *entry = &self->entries[slot];
-                    
-                    // Set the entry
-                    Py_INCREF(key);
-                    Py_INCREF(value);
-                    entry->key = key;
-                    entry->value = value;
-                    entry->hash = hash;
-                    
-                    // Update control word efficiently
-                    uint64_t mask = ~((uint64_t)0xFF << (j * 8));
-                    self->control_words[group_idx * 2] &= mask;
-                    self->control_words[group_idx * 2] |= ((uint64_t)h2 << (j * 8));
-                    
-                    return 0;
-                }
-            }
-        }
-        
-        for (int j = 0; j < 8; ++j) {
-            uint8_t ctrl_byte = (control_high >> (j * 8)) & 0xFF;
-            if (ctrl_byte == SWISS_EMPTY || ctrl_byte == SWISS_DELETED) {
-                size_t slot = group_idx * SWISS_GROUP_SIZE + j + 8;
-                if (slot < self->capacity) {
-                    SwissDictEntry *entry = &self->entries[slot];
-                    
-                    // Set the entry
-                    Py_INCREF(key);
-                    Py_INCREF(value);
-                    entry->key = key;
-                    entry->value = value;
-                    entry->hash = hash;
-                    
-                    // Update control word efficiently
-                    uint64_t mask = ~((uint64_t)0xFF << (j * 8));
-                    self->control_words[group_idx * 2 + 1] &= mask;
-                    self->control_words[group_idx * 2 + 1] |= ((uint64_t)h2 << (j * 8));
-                    
-                    return 0;
-                }
-            }
-        }
-    }
-    
-    return -1;  // No space found
+    PyErr_SetString(PyExc_RuntimeError, "SwissDict: no space available for insertion");
+    return -1;
 }
 
 static int
 swissdict_resize(SwissDictObject *self, Py_ssize_t min_size) {
-    SwissDictEntry *old_entries = self->entries;
-    uint64_t *old_controls = self->control_words;
-    Py_ssize_t old_capacity = self->capacity;
+    SwissGroup *old_groups = self->groups;
+    Py_ssize_t old_num_groups = self->num_groups;
     
     // Calculate new size
     Py_ssize_t new_capacity = SWISS_GROUP_SIZE;
     while (new_capacity < min_size) new_capacity *= 2;
     
-    // Allocate new arrays
-    self->entries = PyMem_Calloc(new_capacity, sizeof(SwissDictEntry));
+    // Allocate new groups
     self->num_groups = new_capacity / SWISS_GROUP_SIZE;
-    self->control_words = PyMem_Calloc(self->num_groups * 2, sizeof(uint64_t));
+    self->groups = PyMem_Calloc(self->num_groups, sizeof(SwissGroup));
     
-    if (!self->entries || !self->control_words) {
-        PyMem_Free(self->entries);
-        PyMem_Free(self->control_words);
-        self->entries = old_entries;
-        self->control_words = old_controls;
+    if (!self->groups) {
+        self->groups = old_groups;
+        self->num_groups = old_num_groups;
         return PyErr_NoMemory(), -1;
     }
     
     self->capacity = new_capacity;
     
-    // Initialize control words (16 bytes per group = 0x80 repeated 16 times)
-    for (size_t i = 0; i < self->num_groups; ++i) {
-        self->control_words[i] = 0x8080808080808080ULL;
-        self->control_words[i + 1] = 0x8080808080808080ULL;
+    // Initialize new groups with empty markers
+    for (Py_ssize_t g = 0; g < self->num_groups; g++) {
+        for (int i = 0; i < SWISS_GROUP_SIZE; i++) {
+            self->groups[g].control[i] = SWISS_EMPTY;
+            self->groups[g].keys[i] = NULL;
+            self->groups[g].values[i] = NULL;
+            self->groups[g].hashes[i] = 0;
+        }
     }
     
     // Reinsert all entries
-    for (Py_ssize_t i = 0; i < old_capacity; i++) {
-        SwissDictEntry *old_entry = &old_entries[i];
-        if (old_entry->key != NULL) {
-            if (insert_into_table(self, old_entry->key, old_entry->value, old_entry->hash) != 0) {
-                // This shouldn't happen, but handle gracefully
-                Py_DECREF(old_entry->key);
-                Py_DECREF(old_entry->value);
+    for (Py_ssize_t g = 0; g < old_num_groups; g++) {
+        SwissGroup *old_group = &old_groups[g];
+        for (int i = 0; i < SWISS_GROUP_SIZE; i++) {
+            if (old_group->keys[i] != NULL) {
+                if (insert_into_table(self, old_group->keys[i], old_group->values[i], old_group->hashes[i]) != 0) {
+                    // Clean up and return error
+                    PyMem_Free(self->groups);
+                    self->groups = old_groups;
+                    self->num_groups = old_num_groups;
+                    self->capacity = old_num_groups * SWISS_GROUP_SIZE;
+                    return -1;
+                }
             }
         }
     }
     
-    PyMem_Free(old_entries);
-    PyMem_Free(old_controls);
+    PyMem_Free(old_groups);
     return 0;
 }
 

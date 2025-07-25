@@ -280,6 +280,9 @@ PYTHONPATH=$(COREPYTHONPATH)
 #_testbuffer _testbuffer.c
 #_testinternalcapi _testinternalcapi.c
 
+# Swiss module
+swiss swissmodule.c
+
 # Some testing modules MUST be built as shared libraries.
 
 #*shared*

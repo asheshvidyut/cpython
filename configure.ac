@@ -7903,6 +7903,7 @@ PY_STDLIB_MOD_SIMPLE([_interpreters])
 PY_STDLIB_MOD_SIMPLE([_interpchannels])
 PY_STDLIB_MOD_SIMPLE([_interpqueues])
 PY_STDLIB_MOD_SIMPLE([_zoneinfo])
+PY_STDLIB_MOD_SIMPLE([swiss])
 
 dnl multiprocessing modules
 PY_STDLIB_MOD([_multiprocessing],
