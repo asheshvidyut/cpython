@@ -18,6 +18,15 @@
 
 /* --- Data Structures --- */
 
+// Contiguous entry structure for better cache locality
+typedef struct {
+    PyObject *key;
+    PyObject *value;
+    Py_hash_t hash;
+    Py_ssize_t prev;  // Previous index in insertion order
+    Py_ssize_t next;  // Next index in insertion order
+} SwissDictEntry;
+
 typedef struct {
     PyObject_HEAD
     Py_ssize_t used;
@@ -27,14 +36,12 @@ typedef struct {
     // Control bytes array: one byte per entry
     uint8_t *ctrl;
     
-    // Data arrays: separate arrays for better cache locality
-    PyObject **keys;
-    PyObject **values;
-    Py_hash_t *hashes;
+    // Contiguous entries array for better cache locality
+    SwissDictEntry *entries;
     
-    // Insertion order tracking
-    Py_ssize_t *insertion_order;  // Array of indices in insertion order
-    Py_ssize_t insertion_count;   // Number of items in insertion order
+    // Doubly linked list pointers
+    Py_ssize_t head;   // Index of first item
+    Py_ssize_t tail;   // Index of last item
 } SwissDictObject;
 
 /* --- Forward Declarations --- */
@@ -132,21 +139,16 @@ swissdict_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
     self->used = 0;
     self->capacity = next_power_of_2(SWISS_GROUP_SIZE * 8);  // Start with power of 2
     self->version = 0;
-    self->insertion_count = 0;
+    self->head = -1;  // No items initially
+    self->tail = -1;
     
     // Allocate arrays
     self->ctrl = PyMem_Calloc(self->capacity + SWISS_GROUP_SIZE, sizeof(uint8_t));
-    self->keys = PyMem_Calloc(self->capacity, sizeof(PyObject*));
-    self->values = PyMem_Calloc(self->capacity, sizeof(PyObject*));
-    self->hashes = PyMem_Calloc(self->capacity, sizeof(Py_hash_t));
-    self->insertion_order = PyMem_Calloc(self->capacity, sizeof(Py_ssize_t));
+    self->entries = PyMem_Calloc(self->capacity, sizeof(SwissDictEntry));
     
-    if (!self->ctrl || !self->keys || !self->values || !self->hashes || !self->insertion_order) {
+    if (!self->ctrl || !self->entries) {
         PyMem_Free(self->ctrl);
-        PyMem_Free(self->keys);
-        PyMem_Free(self->values);
-        PyMem_Free(self->hashes);
-        PyMem_Free(self->insertion_order);
+        PyMem_Free(self->entries);
         Py_DECREF(self);
         return PyErr_NoMemory();
     }
@@ -164,21 +166,16 @@ swissdict_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
 static void
 swissdict_dealloc(SwissDictObject *self) {
     // Decrement reference counts for all stored objects
-    // Only iterate through insertion_order to avoid accessing uninitialized slots
-    for (Py_ssize_t i = 0; i < self->insertion_count; i++) {
-        Py_ssize_t idx = self->insertion_order[i];
-        if (idx >= 0 && idx < self->capacity && self->keys[idx] != NULL) {
-            Py_DECREF(self->keys[idx]);
-            Py_DECREF(self->values[idx]);
+    for (Py_ssize_t i = 0; i < self->capacity; i++) {
+        if (self->entries[i].key != NULL) {
+            Py_DECREF(self->entries[i].key);
+            Py_DECREF(self->entries[i].value);
         }
     }
     
     // Free arrays
     PyMem_Free(self->ctrl);
-    PyMem_Free(self->keys);
-    PyMem_Free(self->values);
-    PyMem_Free(self->hashes);
-    PyMem_Free(self->insertion_order);
+    PyMem_Free(self->entries);
     
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
@@ -205,13 +202,13 @@ swissdict_subscript(SwissDictObject *self, PyObject *key) {
             Py_ssize_t idx = (group_start + i) & (self->capacity - 1);
             
             // Fast H2 filtering - check metadata first
-            if (self->ctrl[idx] == h2 && self->keys[idx] != NULL) {
+            if (self->ctrl[idx] == h2 && self->entries[idx].key != NULL) {
                 // H2 matches, now check full key
-                if (self->keys[idx] == key || 
-                    (self->hashes[idx] == hash && 
-                     PyObject_RichCompareBool(self->keys[idx], key, Py_EQ) == 1)) {
-                    Py_INCREF(self->values[idx]);
-                    return self->values[idx];
+                if (self->entries[idx].key == key || 
+                    (self->entries[idx].hash == hash && 
+                     PyObject_RichCompareBool(self->entries[idx].key, key, Py_EQ) == 1)) {
+                    Py_INCREF(self->entries[idx].value);
+                    return self->entries[idx].value;
                 }
             }
             
@@ -258,16 +255,16 @@ swissdict_ass_sub(SwissDictObject *self, PyObject *key, PyObject *value) {
             Py_ssize_t idx = (group_start + i) & (self->capacity - 1);
             
             // Fast H2 filtering - check metadata first
-            if (self->ctrl[idx] == h2 && self->keys[idx] != NULL) {
+            if (self->ctrl[idx] == h2 && self->entries[idx].key != NULL) {
                 // H2 matches, now check full key
-                if (self->keys[idx] == key || 
-                    (self->hashes[idx] == hash && 
-                     PyObject_RichCompareBool(self->keys[idx], key, Py_EQ) == 1)) {
+                if (self->entries[idx].key == key || 
+                    (self->entries[idx].hash == hash && 
+                     PyObject_RichCompareBool(self->entries[idx].key, key, Py_EQ) == 1)) {
                     
                     // Update existing entry
-                    PyObject *old_value = self->values[idx];
+                    PyObject *old_value = self->entries[idx].value;
                     Py_INCREF(value);
-                    self->values[idx] = value;
+                    self->entries[idx].value = value;
                     Py_DECREF(old_value);
                     self->version++;
                     return 0;
@@ -296,14 +293,25 @@ insert_new:
     // Set the entry
     Py_INCREF(key);
     Py_INCREF(value);
-    self->keys[data_index] = key;
-    self->values[data_index] = value;
-    self->hashes[data_index] = hash;
+    self->entries[data_index].key = key;
+    self->entries[data_index].value = value;
+    self->entries[data_index].hash = hash;
     self->ctrl[data_index] = h2;  // Mark as full
     
-    // Update insertion order
-    self->insertion_order[self->insertion_count] = data_index;
-    self->insertion_count++;
+    // Add to doubly linked list (insertion order)
+    if (self->head == -1) {
+        // First item
+        self->head = data_index;
+        self->tail = data_index;
+        self->entries[data_index].prev = -1;
+        self->entries[data_index].next = -1;
+    } else {
+        // Add to tail
+        self->entries[self->tail].next = data_index;
+        self->entries[data_index].prev = self->tail;
+        self->entries[data_index].next = -1;
+        self->tail = data_index;
+    }
     
     self->used++;
     self->version++;
@@ -313,42 +321,33 @@ insert_new:
 static int
 swissdict_resize(SwissDictObject *self, Py_ssize_t min_size) {
     uint8_t *old_ctrl = self->ctrl;
-    PyObject **old_keys = self->keys;
-    PyObject **old_values = self->values;
-    Py_hash_t *old_hashes = self->hashes;
-    Py_ssize_t *old_insertion_order = self->insertion_order;
+    SwissDictEntry *old_entries = self->entries;
     Py_ssize_t old_capacity = self->capacity;
-    Py_ssize_t old_insertion_count = self->insertion_count;
+    Py_ssize_t old_head = self->head;
+    Py_ssize_t old_tail = self->tail;
     
     // Calculate new size (ensure it's a power of 2)
     Py_ssize_t new_capacity = next_power_of_2(min_size);
     
     // Ensure we have enough space for all existing items plus some headroom
-    if (new_capacity < old_insertion_count * 4) {
-        new_capacity = next_power_of_2(old_insertion_count * 4);
+    if (new_capacity < self->used * 4) {
+        new_capacity = next_power_of_2(self->used * 4);
     }
     
     // Allocate new arrays
     self->capacity = new_capacity;
     
     self->ctrl = PyMem_Calloc(self->capacity + SWISS_GROUP_SIZE, sizeof(uint8_t));
-    self->keys = PyMem_Calloc(self->capacity, sizeof(PyObject*));
-    self->values = PyMem_Calloc(self->capacity, sizeof(PyObject*));
-    self->hashes = PyMem_Calloc(self->capacity, sizeof(Py_hash_t));
-    self->insertion_order = PyMem_Calloc(self->capacity, sizeof(Py_ssize_t));
+    self->entries = PyMem_Calloc(self->capacity, sizeof(SwissDictEntry));
     
-    if (!self->ctrl || !self->keys || !self->values || !self->hashes || !self->insertion_order) {
+    if (!self->ctrl || !self->entries) {
         PyMem_Free(self->ctrl);
-        PyMem_Free(self->keys);
-        PyMem_Free(self->values);
-        PyMem_Free(self->hashes);
-        PyMem_Free(self->insertion_order);
+        PyMem_Free(self->entries);
         self->ctrl = old_ctrl;
-        self->keys = old_keys;
-        self->values = old_values;
-        self->hashes = old_hashes;
-        self->insertion_order = old_insertion_order;
+        self->entries = old_entries;
         self->capacity = old_capacity;
+        self->head = old_head;
+        self->tail = old_tail;
         return PyErr_NoMemory(), -1;
     }
     
@@ -359,16 +358,16 @@ swissdict_resize(SwissDictObject *self, Py_ssize_t min_size) {
     // Set sentinel
     self->ctrl[self->capacity] = SWISS_SENTINEL;
     
-    // Reset counters
+    // Reset counters and linked list
     self->used = 0;
-    self->insertion_count = 0;
+    self->head = -1;
+    self->tail = -1;
     
-    // Reinsert all entries in insertion order
-    for (Py_ssize_t i = 0; i < old_insertion_count; i++) {
-        Py_ssize_t old_idx = old_insertion_order[i];
-        if (old_idx >= 0 && old_idx < old_capacity && old_keys[old_idx] != NULL) {
+    // Reinsert all entries
+    for (Py_ssize_t old_idx = 0; old_idx < old_capacity; old_idx++) {
+        if (old_entries[old_idx].key != NULL) {
             // Use the same insertion logic as normal insertion
-            Py_hash_t hash = old_hashes[old_idx];
+            Py_hash_t hash = old_entries[old_idx].hash;
             Py_ssize_t h1 = h1_hash(hash, self->capacity);
             uint8_t h2 = h2_hash(hash);
             Py_ssize_t data_index = -1;
@@ -404,33 +403,36 @@ found_empty_resize:
                     // This is a critical error - we should never run out of space with 4x capacity
                     // Clean up and return error
                     PyMem_Free(self->ctrl);
-                    PyMem_Free(self->keys);
-                    PyMem_Free(self->values);
-                    PyMem_Free(self->hashes);
-                    PyMem_Free(self->insertion_order);
+                    PyMem_Free(self->entries);
                     self->ctrl = old_ctrl;
-                    self->keys = old_keys;
-                    self->values = old_values;
-                    self->hashes = old_hashes;
-                    self->insertion_order = old_insertion_order;
+                    self->entries = old_entries;
                     self->capacity = old_capacity;
-                    self->used = old_insertion_count;
-                    self->insertion_count = old_insertion_count;
                     return -1;
                 }
             }
             
-            // Set the entry
-            Py_INCREF(old_keys[old_idx]);
-            Py_INCREF(old_values[old_idx]);
-            self->keys[data_index] = old_keys[old_idx];
-            self->values[data_index] = old_values[old_idx];
-            self->hashes[data_index] = hash;
-            self->ctrl[data_index] = h2;  // Mark as full
-            
-            // Update insertion order
-            self->insertion_order[self->insertion_count] = data_index;
-            self->insertion_count++;
+                  // Set the entry
+                  Py_INCREF(old_entries[old_idx].key);
+                  Py_INCREF(old_entries[old_idx].value);
+                  self->entries[data_index].key = old_entries[old_idx].key;
+                  self->entries[data_index].value = old_entries[old_idx].value;
+                  self->entries[data_index].hash = hash;
+                  self->ctrl[data_index] = h2;  // Mark as full
+                  
+                  // Add to doubly linked list (maintain insertion order)
+                  if (self->head == -1) {
+                      // First item
+                      self->head = data_index;
+                      self->tail = data_index;
+                      self->entries[data_index].prev = -1;
+                      self->entries[data_index].next = -1;
+                  } else {
+                      // Add to tail
+                      self->entries[self->tail].next = data_index;
+                      self->entries[data_index].prev = self->tail;
+                      self->entries[data_index].next = -1;
+                      self->tail = data_index;
+                  }
             
             self->used++;
         }
@@ -438,10 +440,7 @@ found_empty_resize:
     
     // Free old arrays
     PyMem_Free(old_ctrl);
-    PyMem_Free(old_keys);
-    PyMem_Free(old_values);
-    PyMem_Free(old_hashes);
-    PyMem_Free(old_insertion_order);
+    PyMem_Free(old_entries);
     
     return 0;
 }
@@ -450,13 +449,16 @@ found_empty_resize:
 
 static PyObject *
 swissdict_items(SwissDictObject *self) {
-    PyObject *result = PyList_New(self->insertion_count);
+    PyObject *result = PyList_New(self->used);
     if (!result) return NULL;
     
-    for (Py_ssize_t i = 0; i < self->insertion_count; i++) {
-        Py_ssize_t idx = self->insertion_order[i];
-        PyObject *key = self->keys[idx];
-        PyObject *value = self->values[idx];
+    Py_ssize_t result_idx = 0;
+    
+    // Iterate through doubly linked list in insertion order
+    Py_ssize_t idx = self->head;
+    while (idx != -1) {
+        PyObject *key = self->entries[idx].key;
+        PyObject *value = self->entries[idx].value;
         
         PyObject *item = PyTuple_Pack(2, key, value);
         if (!item) {
@@ -464,7 +466,9 @@ swissdict_items(SwissDictObject *self) {
             return NULL;
         }
         
-        PyList_SET_ITEM(result, i, item);
+        PyList_SET_ITEM(result, result_idx, item);
+        result_idx++;
+        idx = self->entries[idx].next;
     }
     
     return result;
@@ -472,15 +476,20 @@ swissdict_items(SwissDictObject *self) {
 
 static PyObject *
 swissdict_keys(SwissDictObject *self) {
-    PyObject *result = PyList_New(self->insertion_count);
+    PyObject *result = PyList_New(self->used);
     if (!result) return NULL;
     
-    for (Py_ssize_t i = 0; i < self->insertion_count; i++) {
-        Py_ssize_t idx = self->insertion_order[i];
-        PyObject *key = self->keys[idx];
+    Py_ssize_t result_idx = 0;
+    
+    // Iterate through doubly linked list in insertion order
+    Py_ssize_t idx = self->head;
+    while (idx != -1) {
+        PyObject *key = self->entries[idx].key;
         
         Py_INCREF(key);
-        PyList_SET_ITEM(result, i, key);
+        PyList_SET_ITEM(result, result_idx, key);
+        result_idx++;
+        idx = self->entries[idx].next;
     }
     
     return result;
@@ -488,15 +497,20 @@ swissdict_keys(SwissDictObject *self) {
 
 static PyObject *
 swissdict_values(SwissDictObject *self) {
-    PyObject *result = PyList_New(self->insertion_count);
+    PyObject *result = PyList_New(self->used);
     if (!result) return NULL;
     
-    for (Py_ssize_t i = 0; i < self->insertion_count; i++) {
-        Py_ssize_t idx = self->insertion_order[i];
-        PyObject *value = self->values[idx];
+    Py_ssize_t result_idx = 0;
+    
+    // Iterate through doubly linked list in insertion order
+    Py_ssize_t idx = self->head;
+    while (idx != -1) {
+        PyObject *value = self->entries[idx].value;
         
         Py_INCREF(value);
-        PyList_SET_ITEM(result, i, value);
+        PyList_SET_ITEM(result, result_idx, value);
+        result_idx++;
+        idx = self->entries[idx].next;
     }
     
     return result;
