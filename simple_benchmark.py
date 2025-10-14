@@ -11,7 +11,7 @@ def simple_benchmark():
     print("=" * 50)
     
     # Test data
-    test_data = [(f"key_{i}", f"value_{i}") for i in range(10000)]
+    test_data = [(f"key_{i}", f"value_{i}") for i in range(500000)]
     
     # Test built-in dict
     print("\nTesting built-in dict...")

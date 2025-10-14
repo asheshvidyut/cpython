@@ -46,8 +46,8 @@ static inline Py_ssize_t h1_hash(Py_hash_t hash, Py_ssize_t capacity) {
     // Handle negative hashes properly
     Py_ssize_t h = hash;
     if (h < 0) h = -h;
-    // Use modulo instead of bitwise AND to be consistent across different capacities
-    return h % capacity;
+    // Use bitwise AND for power-of-2 capacity (much faster than modulo)
+    return h & (capacity - 1);
 }
 
 static inline uint8_t h2_hash(Py_hash_t hash) {
@@ -194,26 +194,35 @@ swissdict_subscript(SwissDictObject *self, PyObject *key) {
     if (hash == -1) return NULL;
     
     Py_ssize_t h1 = h1_hash(hash, self->capacity);
+    uint8_t h2 = h2_hash(hash);
     
-    // Linear probing to find the key
-    for (Py_ssize_t offset = 0; offset < self->capacity; offset++) {
-        Py_ssize_t idx = (h1 + offset) % self->capacity;
+    // SwissTable group-based probing with H2 filtering
+    for (Py_ssize_t group_offset = 0; group_offset < self->capacity; group_offset += SWISS_GROUP_SIZE) {
+        Py_ssize_t group_start = (h1 + group_offset) & (self->capacity - 1);
         
-        // Check if this slot contains our key
-        if (self->keys[idx] != NULL) {
-            if (self->keys[idx] == key || 
-                (self->hashes[idx] == hash && 
-                 PyObject_RichCompareBool(self->keys[idx], key, Py_EQ) == 1)) {
-                Py_INCREF(self->values[idx]);
-                return self->values[idx];
+        // Check each slot in the group
+        for (Py_ssize_t i = 0; i < SWISS_GROUP_SIZE; i++) {
+            Py_ssize_t idx = (group_start + i) & (self->capacity - 1);
+            
+            // Fast H2 filtering - check metadata first
+            if (self->ctrl[idx] == h2 && self->keys[idx] != NULL) {
+                // H2 matches, now check full key
+                if (self->keys[idx] == key || 
+                    (self->hashes[idx] == hash && 
+                     PyObject_RichCompareBool(self->keys[idx], key, Py_EQ) == 1)) {
+                    Py_INCREF(self->values[idx]);
+                    return self->values[idx];
+                }
+            }
+            
+            // If we find an empty slot, the key is not in the table
+            if (is_empty(self->ctrl[idx])) {
+                goto not_found;
             }
         }
-        
-        // If we find an empty slot, the key is not in the table
-        if (is_empty(self->ctrl[idx])) {
-            break;
-        }
     }
+    
+not_found:
     
     PyErr_SetObject(PyExc_KeyError, key);
     return NULL;
@@ -229,53 +238,51 @@ swissdict_ass_sub(SwissDictObject *self, PyObject *key, PyObject *value) {
     Py_hash_t hash = PyObject_Hash(key);
     if (hash == -1) return -1;
     
-    Py_ssize_t h1 = h1_hash(hash, self->capacity);
-    uint8_t h2 = h2_hash(hash);
-    
-    // Check if key already exists - use linear probing
-    for (Py_ssize_t offset = 0; offset < self->capacity; offset++) {
-        Py_ssize_t idx = (h1 + offset) % self->capacity;
-        
-        // Check if this slot contains our key
-        if (self->keys[idx] != NULL) {
-            if (self->keys[idx] == key || 
-                (self->hashes[idx] == hash && 
-                 PyObject_RichCompareBool(self->keys[idx], key, Py_EQ) == 1)) {
-                
-                // Update existing entry
-                PyObject *old_value = self->values[idx];
-                Py_INCREF(value);
-                self->values[idx] = value;
-                Py_DECREF(old_value);
-                self->version++;
-                return 0;
-            }
-        }
-        
-        // If we find an empty slot, the key is not in the table
-        if (is_empty(self->ctrl[idx])) {
-            break;
-        }
-    }
-    
-    // Key doesn't exist, insert new entry
-    if (self->used >= self->capacity * 0.75) {  // 75% load factor
+    // Check if we need to resize first
+    if (self->used >= self->capacity * 0.875) {  // 87.5% load factor (SwissTable style)
         if (swissdict_resize(self, self->capacity * 2) != 0) {
             return -1;
         }
-        // Recalculate hash after resize
-        h1 = h1_hash(hash, self->capacity);
     }
     
-    // Find empty slot and insert - use linear probing
+    Py_ssize_t h1 = h1_hash(hash, self->capacity);
+    uint8_t h2 = h2_hash(hash);
     Py_ssize_t data_index = -1;
-    for (Py_ssize_t offset = 0; offset < self->capacity; offset++) {
-        Py_ssize_t idx = (h1 + offset) % self->capacity;
-        if (is_empty(self->ctrl[idx])) {
-            data_index = idx;
-            break;
+    
+    // SwissTable group-based probing with H2 filtering
+    for (Py_ssize_t group_offset = 0; group_offset < self->capacity; group_offset += SWISS_GROUP_SIZE) {
+        Py_ssize_t group_start = (h1 + group_offset) & (self->capacity - 1);
+        
+        // Check each slot in the group for existing key
+        for (Py_ssize_t i = 0; i < SWISS_GROUP_SIZE; i++) {
+            Py_ssize_t idx = (group_start + i) & (self->capacity - 1);
+            
+            // Fast H2 filtering - check metadata first
+            if (self->ctrl[idx] == h2 && self->keys[idx] != NULL) {
+                // H2 matches, now check full key
+                if (self->keys[idx] == key || 
+                    (self->hashes[idx] == hash && 
+                     PyObject_RichCompareBool(self->keys[idx], key, Py_EQ) == 1)) {
+                    
+                    // Update existing entry
+                    PyObject *old_value = self->values[idx];
+                    Py_INCREF(value);
+                    self->values[idx] = value;
+                    Py_DECREF(old_value);
+                    self->version++;
+                    return 0;
+                }
+            }
+            
+            // If we find an empty slot, the key is not in the table
+            if (is_empty(self->ctrl[idx])) {
+                data_index = idx;
+                goto insert_new;
+            }
         }
     }
+    
+insert_new:
     
     if (data_index == -1) {
         // If we still can't find space, we need to resize
@@ -292,7 +299,7 @@ swissdict_ass_sub(SwissDictObject *self, PyObject *key, PyObject *value) {
     self->keys[data_index] = key;
     self->values[data_index] = value;
     self->hashes[data_index] = hash;
-    self->ctrl[data_index] = SWISS_FULL;  // Mark as full
+    self->ctrl[data_index] = h2;  // Mark as full
     
     // Update insertion order
     self->insertion_order[self->insertion_count] = data_index;
@@ -363,16 +370,24 @@ swissdict_resize(SwissDictObject *self, Py_ssize_t min_size) {
             // Use the same insertion logic as normal insertion
             Py_hash_t hash = old_hashes[old_idx];
             Py_ssize_t h1 = h1_hash(hash, self->capacity);
-            
-            // Find empty slot and insert - use linear probing
+            uint8_t h2 = h2_hash(hash);
             Py_ssize_t data_index = -1;
-            for (Py_ssize_t offset = 0; offset < self->capacity; offset++) {
-                Py_ssize_t idx = (h1 + offset) % self->capacity;
-                if (is_empty(self->ctrl[idx])) {
-                    data_index = idx;
-                    break;
+            
+            // Find empty slot and insert - use group-based probing
+            for (Py_ssize_t group_offset = 0; group_offset < self->capacity; group_offset += SWISS_GROUP_SIZE) {
+                Py_ssize_t group_start = (h1 + group_offset) & (self->capacity - 1);
+                
+                // Check each slot in the group for empty slot
+                for (Py_ssize_t i = 0; i < SWISS_GROUP_SIZE; i++) {
+                    Py_ssize_t idx = (group_start + i) & (self->capacity - 1);
+                    if (is_empty(self->ctrl[idx])) {
+                        data_index = idx;
+                        goto found_empty_resize;
+                    }
                 }
             }
+            
+found_empty_resize:
             
             // This should never fail with 4x capacity, but if it does, try linear probing
             if (data_index == -1) {
@@ -411,7 +426,7 @@ swissdict_resize(SwissDictObject *self, Py_ssize_t min_size) {
             self->keys[data_index] = old_keys[old_idx];
             self->values[data_index] = old_values[old_idx];
             self->hashes[data_index] = hash;
-            self->ctrl[data_index] = SWISS_FULL;  // Mark as full
+            self->ctrl[data_index] = h2;  // Mark as full
             
             // Update insertion order
             self->insertion_order[self->insertion_count] = data_index;
