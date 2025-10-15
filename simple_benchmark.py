@@ -3,7 +3,8 @@
 Simple benchmark comparing SwissDict with Python's built-in dict.
 """
 
-import time
+import timeit
+import random
 from swiss import SwissDict
 
 def simple_benchmark():
@@ -11,56 +12,67 @@ def simple_benchmark():
     print("=" * 50)
     
     # Test data
-    test_data = [(f"key_{i}", f"value_{i}") for i in range(500000)]
+    test_data = [(f"key_{i}", f"value_{i}") for i in range(100000)]
+    lookup_keys = [key for key, _ in test_data]
+    random.shuffle(lookup_keys)
     
-    # Test built-in dict
+    # Setup functions for timeit
+    def setup_builtin_dict():
+        d = {}
+        for key, value in test_data:
+            d[key] = value
+        return d
+    
+    def setup_swiss_dict():
+        d = SwissDict()
+        for key, value in test_data:
+            d[key] = value
+        return d
+    
+    # Test built-in dict insertion
     print("\nTesting built-in dict...")
-    start_time = time.perf_counter()
-    d1 = {}
-    for key, value in test_data:
-        d1[key] = value
-    end_time = time.perf_counter()
-    builtin_insert_time = end_time - start_time
+    builtin_insert_time = timeit.timeit(
+        lambda: setup_builtin_dict(),
+        number=10
+    ) / 10
     print(f"Built-in dict insertion: {builtin_insert_time:.6f} seconds")
     
-    # Test lookups
-    start_time = time.perf_counter()
-    for key, _ in test_data:
-        _ = d1[key]
-    end_time = time.perf_counter()
-    builtin_lookup_time = end_time - start_time
+    # Test built-in dict lookup
+    d1 = setup_builtin_dict()
+    builtin_lookup_time = timeit.timeit(
+        lambda: [d1[key] for key in lookup_keys],
+        number=10
+    ) / 10
     print(f"Built-in dict lookup: {builtin_lookup_time:.6f} seconds")
     
-    # Test iteration
-    start_time = time.perf_counter()
-    items = list(d1.items())
-    end_time = time.perf_counter()
-    builtin_iter_time = end_time - start_time
+    # Test built-in dict iteration
+    builtin_iter_time = timeit.timeit(
+        lambda: list(d1.items()),
+        number=10
+    ) / 10
     print(f"Built-in dict iteration: {builtin_iter_time:.6f} seconds")
     
-    # Test SwissDict
+    # Test SwissDict insertion
     print("\nTesting SwissDict...")
-    start_time = time.perf_counter()
-    d2 = SwissDict()
-    for key, value in test_data:
-        d2[key] = value
-    end_time = time.perf_counter()
-    swiss_insert_time = end_time - start_time
+    swiss_insert_time = timeit.timeit(
+        lambda: setup_swiss_dict(),
+        number=10
+    ) / 10
     print(f"SwissDict insertion: {swiss_insert_time:.6f} seconds")
     
-    # Test lookups
-    start_time = time.perf_counter()
-    for key, _ in test_data:
-        _ = d2[key]
-    end_time = time.perf_counter()
-    swiss_lookup_time = end_time - start_time
+    # Test SwissDict lookup
+    d2 = setup_swiss_dict()
+    swiss_lookup_time = timeit.timeit(
+        lambda: [d2[key] for key in lookup_keys],
+        number=10
+    ) / 10
     print(f"SwissDict lookup: {swiss_lookup_time:.6f} seconds")
     
-    # Test iteration
-    start_time = time.perf_counter()
-    items = list(d2.items())
-    end_time = time.perf_counter()
-    swiss_iter_time = end_time - start_time
+    # Test SwissDict iteration
+    swiss_iter_time = timeit.timeit(
+        lambda: list(d2.items()),
+        number=10
+    ) / 10
     print(f"SwissDict iteration: {swiss_iter_time:.6f} seconds")
     
     # Performance comparison

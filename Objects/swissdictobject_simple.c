@@ -7,8 +7,11 @@
 
 #include "Python.h"
 #include <stdint.h>  // For uint8_t, uint32_t
+#ifdef __SSE2__
+#include <emmintrin.h>  // For SSE2 intrinsics
+#endif
 
-/* --- Swiss Tables Constants --- */
+/* --- Swiss Tables Constants (from cwisstable) --- */
 #define SWISS_GROUP_SIZE 16
 #define SWISS_EMPTY 0x80
 #define SWISS_DELETED 0xFE
@@ -16,15 +19,19 @@
 #define SWISS_FULL 0x7F
 #define SWISS_H2_MASK 0x7F
 
+/* --- Load Factor Optimization (cwisstable uses 87.5%) --- */
+#define SWISS_MAX_LOAD_FACTOR 0.875  // 87.5% load factor (vs 75%)
+#define SWISS_MIN_LOAD_FACTOR 0.125  // 12.5% minimum load factor
+
 /* --- Data Structures --- */
 
-// Contiguous entry structure for better cache locality
+// SwissTable entry structure with doubly linked list for insertion order
 typedef struct {
     PyObject *key;
     PyObject *value;
     Py_hash_t hash;
-    Py_ssize_t prev;  // Previous index in insertion order
-    Py_ssize_t next;  // Next index in insertion order
+    Py_ssize_t prev;  // Previous node in insertion order
+    Py_ssize_t next;  // Next node in insertion order
 } SwissDictEntry;
 
 typedef struct {
@@ -39,15 +46,15 @@ typedef struct {
     // Contiguous entries array for better cache locality
     SwissDictEntry *entries;
     
-    // Doubly linked list pointers
-    Py_ssize_t head;   // Index of first item
-    Py_ssize_t tail;   // Index of last item
+    // Doubly linked list pointers for insertion order
+    Py_ssize_t head;   // Index of first item in insertion order
+    Py_ssize_t tail;   // Index of last item in insertion order
 } SwissDictObject;
 
 /* --- Forward Declarations --- */
 static int swissdict_resize(SwissDictObject *self, Py_ssize_t min_size);
 
-/* --- Hash Functions --- */
+/* --- Hash Functions (Optimized for Swiss Tables) --- */
 
 static inline Py_ssize_t h1_hash(Py_hash_t hash, Py_ssize_t capacity) {
     // Handle negative hashes properly
@@ -61,14 +68,100 @@ static inline uint8_t h2_hash(Py_hash_t hash) {
     // Handle negative hashes properly and extract H2 bits
     Py_ssize_t h = hash;
     if (h < 0) h = -h;
-    // Extract the upper 7 bits for H2 (like abseil)
-    return (uint8_t)((h >> (sizeof(Py_hash_t) * 8 - 7)) & SWISS_H2_MASK);
+    
+    // Extract H2 bits for control byte (7 bits)
+    return (uint8_t)((h >> 25) & SWISS_H2_MASK);
 }
 
 /* --- Control Byte Management --- */
 
 static inline int is_empty(uint8_t ctrl) {
     return ctrl == SWISS_EMPTY;
+}
+
+/* --- Swiss Table Group Operations (SIMD Optimized) --- */
+
+// SIMD-optimized group matching for H2 filtering
+static inline int group_match(const uint8_t *ctrl, uint8_t h2) {
+#ifdef __SSE2__
+    // Use SSE2 for 128-bit operations (16 bytes at once)
+    __m128i ctrl_vec = _mm_loadu_si128((__m128i*)ctrl);
+    __m128i h2_vec = _mm_set1_epi8(h2);
+    __m128i match = _mm_cmpeq_epi8(ctrl_vec, h2_vec);
+    int mask = _mm_movemask_epi8(match);
+    
+    if (mask) {
+        return __builtin_ctz(mask);  // Find first set bit
+    }
+    return -1;
+#else
+    // Fallback: use 64-bit operations when SSE2 not available
+    uint64_t ctrl_64 = *(uint64_t*)ctrl;
+    uint64_t h2_64 = h2 | (h2 << 8) | (h2 << 16) | (h2 << 24) | 
+                     ((uint64_t)h2 << 32) | ((uint64_t)h2 << 40) | ((uint64_t)h2 << 48) | ((uint64_t)h2 << 56);
+    uint64_t match_64 = ctrl_64 ^ h2_64;
+    
+    if (match_64) {
+        // Find first zero byte (matching h2)
+        uint64_t zero_bytes = ((match_64 - 0x0101010101010101ULL) & ~match_64) & 0x8080808080808080ULL;
+        if (zero_bytes) {
+            return __builtin_ctzll(zero_bytes) >> 3;
+        }
+    }
+    
+    // Check second 64-bit chunk
+    ctrl_64 = *((uint64_t*)ctrl + 1);
+    match_64 = ctrl_64 ^ h2_64;
+    if (match_64) {
+        uint64_t zero_bytes = ((match_64 - 0x0101010101010101ULL) & ~match_64) & 0x8080808080808080ULL;
+        if (zero_bytes) {
+            return 8 + (__builtin_ctzll(zero_bytes) >> 3);
+        }
+    }
+    
+    return -1;
+#endif
+}
+
+// SIMD-optimized empty slot finding
+static inline int group_find_empty(const uint8_t *ctrl) {
+#ifdef __SSE2__
+    // Use SSE2 for 128-bit operations
+    __m128i ctrl_vec = _mm_loadu_si128((__m128i*)ctrl);
+    __m128i empty_vec = _mm_set1_epi8(SWISS_EMPTY);
+    __m128i match = _mm_cmpeq_epi8(ctrl_vec, empty_vec);
+    int mask = _mm_movemask_epi8(match);
+    
+    if (mask) {
+        return __builtin_ctz(mask);  // Find first set bit
+    }
+    return -1;
+#else
+    // Fallback: use 64-bit operations
+    uint64_t ctrl_64 = *(uint64_t*)ctrl;
+    uint64_t empty_64 = SWISS_EMPTY | (SWISS_EMPTY << 8) | (SWISS_EMPTY << 16) | (SWISS_EMPTY << 24) | 
+                        ((uint64_t)SWISS_EMPTY << 32) | ((uint64_t)SWISS_EMPTY << 40) | ((uint64_t)SWISS_EMPTY << 48) | ((uint64_t)SWISS_EMPTY << 56);
+    uint64_t match_64 = ctrl_64 ^ empty_64;
+    
+    if (match_64) {
+        uint64_t zero_bytes = ((match_64 - 0x0101010101010101ULL) & ~match_64) & 0x8080808080808080ULL;
+        if (zero_bytes) {
+            return __builtin_ctzll(zero_bytes) >> 3;
+        }
+    }
+    
+    // Check second 64-bit chunk
+    ctrl_64 = *((uint64_t*)ctrl + 1);
+    match_64 = ctrl_64 ^ empty_64;
+    if (match_64) {
+        uint64_t zero_bytes = ((match_64 - 0x0101010101010101ULL) & ~match_64) & 0x8080808080808080ULL;
+        if (zero_bytes) {
+            return 8 + (__builtin_ctzll(zero_bytes) >> 3);
+        }
+    }
+    
+    return -1;
+#endif
 }
 
 static inline int is_deleted(uint8_t ctrl) {
@@ -83,31 +176,27 @@ static inline int is_empty_or_deleted(uint8_t ctrl) {
     return ctrl >= SWISS_EMPTY;
 }
 
-/* --- Group Operations --- */
+/* --- Group Operations (SIMD-Optimized) --- */
 
 typedef struct {
     uint8_t ctrl[SWISS_GROUP_SIZE];
 } Group;
 
-static inline void group_init(Group *group, const uint8_t *ctrl, Py_ssize_t offset, Py_ssize_t capacity) {
+// Optimized group matching using simple loop (more reliable)
+static inline int group_match_simd(const uint8_t *ctrl, uint8_t h2) {
+    // Simple but fast scalar version
     for (int i = 0; i < SWISS_GROUP_SIZE; i++) {
-        Py_ssize_t idx = (offset + i) & (capacity - 1);  // Wrap around using bitwise AND
-        group->ctrl[i] = ctrl[idx];
-    }
-}
-
-static inline int group_match(const Group *group, uint8_t h2) {
-    for (int i = 0; i < SWISS_GROUP_SIZE; i++) {
-        if (group->ctrl[i] == h2) {
+        if (ctrl[i] == h2) {
             return i;
         }
     }
     return -1;
 }
 
-static inline int group_find_empty(const Group *group) {
+static inline int group_find_empty_simd(const uint8_t *ctrl) {
+    // Simple but fast scalar version
     for (int i = 0; i < SWISS_GROUP_SIZE; i++) {
-        if (is_empty_or_deleted(group->ctrl[i])) {
+        if (is_empty_or_deleted(ctrl[i])) {
             return i;
         }
     }
@@ -193,33 +282,33 @@ swissdict_subscript(SwissDictObject *self, PyObject *key) {
     Py_ssize_t h1 = h1_hash(hash, self->capacity);
     uint8_t h2 = h2_hash(hash);
     
-    // SwissTable group-based probing with H2 filtering
+    // Swiss Table group-based probing
+    Py_ssize_t group_start = h1 & ~(SWISS_GROUP_SIZE - 1);  // Align to group boundary
+    
     for (Py_ssize_t group_offset = 0; group_offset < self->capacity; group_offset += SWISS_GROUP_SIZE) {
-        Py_ssize_t group_start = (h1 + group_offset) & (self->capacity - 1);
+        Py_ssize_t current_group = (group_start + group_offset) & (self->capacity - 1);
         
-        // Check each slot in the group
-        for (Py_ssize_t i = 0; i < SWISS_GROUP_SIZE; i++) {
-            Py_ssize_t idx = (group_start + i) & (self->capacity - 1);
+        // Check if group has any empty slots (early termination)
+        int empty_idx = group_find_empty(&self->ctrl[current_group]);
+        if (empty_idx >= 0) {
+            // Found empty slot, key is not in table
+            break;
+        }
+        
+        // Look for H2 matches in this group
+        int match_idx = group_match(&self->ctrl[current_group], h2);
+        if (match_idx >= 0) {
+            Py_ssize_t idx = current_group + match_idx;
             
-            // Fast H2 filtering - check metadata first
-            if (self->ctrl[idx] == h2 && self->entries[idx].key != NULL) {
-                // H2 matches, now check full key
-                if (self->entries[idx].key == key || 
-                    (self->entries[idx].hash == hash && 
-                     PyObject_RichCompareBool(self->entries[idx].key, key, Py_EQ) == 1)) {
-                    Py_INCREF(self->entries[idx].value);
-                    return self->entries[idx].value;
-                }
-            }
-            
-            // If we find an empty slot, the key is not in the table
-            if (is_empty(self->ctrl[idx])) {
-                goto not_found;
+            // H2 matches, now check full key
+            if (self->entries[idx].key == key || 
+                (self->entries[idx].hash == hash && 
+                 PyObject_RichCompareBool(self->entries[idx].key, key, Py_EQ) == 1)) {
+                Py_INCREF(self->entries[idx].value);
+                return self->entries[idx].value;
             }
         }
     }
-    
-not_found:
     
     PyErr_SetObject(PyExc_KeyError, key);
     return NULL;
@@ -246,35 +335,38 @@ swissdict_ass_sub(SwissDictObject *self, PyObject *key, PyObject *value) {
     uint8_t h2 = h2_hash(hash);
     Py_ssize_t data_index = -1;
     
-    // SwissTable group-based probing with H2 filtering
+    // Swiss Table group-based probing
+    Py_ssize_t group_start = h1 & ~(SWISS_GROUP_SIZE - 1);  // Align to group boundary
+    
     for (Py_ssize_t group_offset = 0; group_offset < self->capacity; group_offset += SWISS_GROUP_SIZE) {
-        Py_ssize_t group_start = (h1 + group_offset) & (self->capacity - 1);
+        Py_ssize_t current_group = (group_start + group_offset) & (self->capacity - 1);
         
-        // Check each slot in the group for existing key
-        for (Py_ssize_t i = 0; i < SWISS_GROUP_SIZE; i++) {
-            Py_ssize_t idx = (group_start + i) & (self->capacity - 1);
+        // Look for H2 matches in this group
+        int match_idx = group_match(&self->ctrl[current_group], h2);
+        if (match_idx >= 0) {
+            Py_ssize_t idx = current_group + match_idx;
             
-            // Fast H2 filtering - check metadata first
-            if (self->ctrl[idx] == h2 && self->entries[idx].key != NULL) {
-                // H2 matches, now check full key
-                if (self->entries[idx].key == key || 
-                    (self->entries[idx].hash == hash && 
-                     PyObject_RichCompareBool(self->entries[idx].key, key, Py_EQ) == 1)) {
-                    
-                    // Update existing entry
-                    PyObject *old_value = self->entries[idx].value;
-                    Py_INCREF(value);
-                    self->entries[idx].value = value;
-                    Py_DECREF(old_value);
-                    self->version++;
-                    return 0;
-                }
+            // H2 matches, now check full key
+            if (self->entries[idx].key == key || 
+                (self->entries[idx].hash == hash && 
+                 PyObject_RichCompareBool(self->entries[idx].key, key, Py_EQ) == 1)) {
+                
+                // Update existing entry
+                PyObject *old_value = self->entries[idx].value;
+                Py_INCREF(value);
+                self->entries[idx].value = value;
+                Py_DECREF(old_value);
+                self->version++;
+                return 0;
             }
-            
-            // If we find an empty slot, the key is not in the table
-            if (is_empty(self->ctrl[idx])) {
-                data_index = idx;
-                goto insert_new;
+        }
+        
+        // Look for empty slot in this group
+        if (data_index == -1) {
+            int empty_idx = group_find_empty(&self->ctrl[current_group]);
+            if (empty_idx >= 0) {
+                data_index = current_group + empty_idx;
+                break; // Found empty slot, we can insert here
             }
         }
     }
@@ -456,7 +548,7 @@ swissdict_items(SwissDictObject *self) {
     
     // Iterate through doubly linked list in insertion order
     Py_ssize_t idx = self->head;
-    while (idx != -1) {
+    while (idx != -1 && result_idx < self->used) {
         PyObject *key = self->entries[idx].key;
         PyObject *value = self->entries[idx].value;
         
@@ -483,7 +575,7 @@ swissdict_keys(SwissDictObject *self) {
     
     // Iterate through doubly linked list in insertion order
     Py_ssize_t idx = self->head;
-    while (idx != -1) {
+    while (idx != -1 && result_idx < self->used) {
         PyObject *key = self->entries[idx].key;
         
         Py_INCREF(key);
@@ -504,7 +596,7 @@ swissdict_values(SwissDictObject *self) {
     
     // Iterate through doubly linked list in insertion order
     Py_ssize_t idx = self->head;
-    while (idx != -1) {
+    while (idx != -1 && result_idx < self->used) {
         PyObject *value = self->entries[idx].value;
         
         Py_INCREF(value);
